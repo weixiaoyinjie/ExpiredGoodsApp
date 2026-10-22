@@ -1,11 +1,9 @@
-name: Build Android APK (diagnostic v2)
+name: Build Expired Goods APK (v3 SDK fix)
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-      - master
+    branches: [main]
 
 permissions:
   contents: read
@@ -25,93 +23,105 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Prepare Android SDK
-        uses: android-actions/setup-android@v3
+      # GitHub's Ubuntu runner comes with the Android SDK. Do not use
+      # android-actions/setup-android, which failed during SDK initialization.
+      - name: Use preinstalled Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          if [[ ! -d "$sdk" ]]; then
+            echo "::error::Android SDK directory not found: $sdk"
+            exit 1
+          fi
+          echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$sdk" >> "$GITHUB_ENV"
+          echo "$sdk/platform-tools" >> "$GITHUB_PATH"
+          echo "Using Android SDK at: $sdk"
+          echo 'Available Android platforms:'
+          ls -1 "$sdk/platforms" || true
+          echo 'Available build tools:'
+          ls -1 "$sdk/build-tools" || true
 
-      - name: Set up Gradle 8.9 as fallback
+      - name: Set up Gradle 8.9 fallback
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
-      - name: Locate Android source (root, folder, or uploaded ZIP)
+      - name: Locate and unpack app source
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/build-artifacts"
-          # A complete Gradle project may be uploaded directly or as one ZIP.
-          project_file="$(find "$GITHUB_WORKSPACE" -maxdepth 5 -type f \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) -not -path '*/.git/*' -not -path '*/.gradle/*' | sort | head -n 1)"
-          if [[ -z "$project_file" ]]; then
-            mapfile -t archives < <(find "$GITHUB_WORKSPACE" -maxdepth 2 -type f -iname '*.zip' -not -path '*/.git/*' | sort)
-            if (( ${#archives[@]} == 0 )); then
-              echo 'ERROR: No settings.gradle(.kts) and no source ZIP found.'
+          mkdir -p "$RUNNER_TEMP/build-logs"
+          # Prefer a project already present as plain files.
+          mapfile -t projects < <(find "$GITHUB_WORKSPACE" -maxdepth 6 -type f \( -name settings.gradle -o -name settings.gradle.kts \) -not -path '*/.gradle/*' | sort)
+          if (( ${#projects[@]} == 0 )); then
+            # Explicitly choose the app source ZIP, not build-apk-v2-package.zip.
+            source_zip="$GITHUB_WORKSPACE/ExpiredGoods_OneUpload.zip"
+            if [[ ! -f "$source_zip" ]]; then
+              echo '::error::Missing ExpiredGoods_OneUpload.zip in repository root.'
               exit 1
             fi
-            if (( ${#archives[@]} > 1 )); then
-              echo 'ERROR: Multiple ZIPs found. Keep only one complete source ZIP in the repository.'
-              printf 'Found: %s\n' "${archives[@]}"
-              exit 1
-            fi
-            mkdir -p "$RUNNER_TEMP/android-source"
-            unzip -q "${archives[0]}" -d "$RUNNER_TEMP/android-source"
-            project_file="$(find "$RUNNER_TEMP/android-source" -maxdepth 7 -type f \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) -not -path '*/__MACOSX/*' | sort | head -n 1)"
+            echo "Extracting source: $source_zip"
+            mkdir -p "$RUNNER_TEMP/expired-goods-source"
+            unzip -q "$source_zip" -d "$RUNNER_TEMP/expired-goods-source"
+            mapfile -t projects < <(find "$RUNNER_TEMP/expired-goods-source" -maxdepth 9 -type f \( -name settings.gradle -o -name settings.gradle.kts \) | sort)
           fi
-          if [[ -z "$project_file" ]]; then
-            echo 'ERROR: Source ZIP does not contain settings.gradle or settings.gradle.kts.'
+          if (( ${#projects[@]} == 0 )); then
+            echo '::error::App ZIP has no settings.gradle or settings.gradle.kts.'
             exit 1
           fi
-          project_dir="$(dirname "$project_file")"
+          project_dir="$(dirname "${projects[0]}")"
           echo "PROJECT_DIR=$project_dir" >> "$GITHUB_ENV"
-          echo "Found Gradle project: $project_dir"
+          echo "App project: $project_dir"
           ls -la "$project_dir"
           if [[ -f "$project_dir/gradlew" ]]; then
             chmod +x "$project_dir/gradlew"
           fi
 
-      - name: Build APK and extract important errors
-        id: compile
+      - name: Build APK and capture errors
         shell: bash
         run: |
           set -uo pipefail
           cd "$PROJECT_DIR"
-          log="$RUNNER_TEMP/build-artifacts/full-build.log"
-          if [[ -f './gradlew' ]]; then
-            command=(./gradlew)
+          log="$RUNNER_TEMP/build-logs/full-build.log"
+          if [[ -f ./gradlew && -f ./gradle/wrapper/gradle-wrapper.jar ]]; then
+            build_command=(./gradlew)
           else
-            command=(gradle)
+            build_command=(gradle)
           fi
-          echo "Building with ${command[0]}"
-          "${command[@]}" :app:assembleDebug --no-daemon --console=plain --stacktrace > "$log" 2>&1
+          echo "Using: ${build_command[*]}"
+          "${build_command[@]}" assembleDebug --no-daemon --console=plain --stacktrace > "$log" 2>&1
           status=$?
           cat "$log"
           {
-            echo "Exit code: $status"
-            echo '========== IMPORTANT ERROR LINES =========='
-            grep -n -i -E '(^e: |^error:|error:|what went wrong:|execution failed for task|^FAILURE:|caused by:|could not resolve|could not find|unresolved reference|compilation error|a problem occurred)' "$log" | tail -n 90 || true
-            echo '========== LAST 100 LINES =========='
+            printf 'Build exit code: %s\n' "$status"
+            echo '--- Key errors ---'
+            grep -nEi 'FAILURE:|What went wrong:|Execution failed|error:|^e: |Caused by:|Could not resolve|Could not find|Unresolved reference|A problem occurred' "$log" | tail -n 70 || true
+            echo '--- Last 100 lines ---'
             tail -n 100 "$log"
-          } | tee "$RUNNER_TEMP/build-artifacts/error-summary.txt"
-          {
-            echo '## Android APK build'
-            echo "Exit code: **$status**"
-            echo ''
-            echo '### Relevant errors'
-            echo '```text'
-            grep -n -i -E '(^e: |^error:|error:|what went wrong:|execution failed for task|^FAILURE:|caused by:|could not resolve|could not find|unresolved reference|compilation error|a problem occurred)' "$log" | tail -n 35 || true
-            echo '```'
-            echo 'For the complete log, download the build-logs artifact.'
-          } >> "$GITHUB_STEP_SUMMARY"
+          } > "$RUNNER_TEMP/build-logs/error-summary.txt"
+          if (( status != 0 )); then
+            echo '### Build error summary' >> "$GITHUB_STEP_SUMMARY"
+            echo '```text' >> "$GITHUB_STEP_SUMMARY"
+            cat "$RUNNER_TEMP/build-logs/error-summary.txt" | head -n 130 >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo '::error::APK build failed. Download build-logs for details.'
+          else
+            echo '### APK compiled successfully' >> "$GITHUB_STEP_SUMMARY"
+          fi
           exit "$status"
 
-      - name: Upload full log and error summary even if build fails
+      - name: Upload build logs, including on failure
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: build-logs
-          path: ${{ runner.temp }}/build-artifacts/
+          path: ${{ runner.temp }}/build-logs/
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Collect debug APK files
+      - name: Collect debug APK
         if: success()
         shell: bash
         run: |
@@ -121,12 +131,12 @@ jobs:
           while IFS= read -r -d '' apk; do
             count=$((count + 1))
             cp "$apk" "$GITHUB_WORKSPACE/apk-output/app-debug-${count}.apk"
-          done < <(find "$PROJECT_DIR" -type f -path '*/build/outputs/apk/*' -name '*.apk' -print0)
+          done < <(find "$PROJECT_DIR" -type f -path '*/build/outputs/apk/*' -name '*debug*.apk' -print0)
           if (( count == 0 )); then
-            echo 'ERROR: Gradle succeeded but no APK found.'
+            echo '::error::Build completed but no debug APK was found.'
             exit 1
           fi
-          echo "Copied $count APK(s)."
+          echo "Collected $count APK(s)."
 
       - name: Upload APK
         if: success()
