@@ -1,4 +1,4 @@
-name: Build Expired Goods APK (v3 SDK fix)
+name: Build Expired Goods APK (v4 Java fix)
 
 on:
   workflow_dispatch:
@@ -23,25 +23,18 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # GitHub's Ubuntu runner comes with the Android SDK. Do not use
-      # android-actions/setup-android, which failed during SDK initialization.
       - name: Use preinstalled Android SDK
         shell: bash
         run: |
           set -euo pipefail
           sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
           if [[ ! -d "$sdk" ]]; then
-            echo "::error::Android SDK directory not found: $sdk"
+            echo "::error::Android SDK not found: $sdk"
             exit 1
           fi
           echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$sdk" >> "$GITHUB_ENV"
-          echo "$sdk/platform-tools" >> "$GITHUB_PATH"
-          echo "Using Android SDK at: $sdk"
-          echo 'Available Android platforms:'
-          ls -1 "$sdk/platforms" || true
-          echo 'Available build tools:'
-          ls -1 "$sdk/build-tools" || true
+          echo "Using Android SDK at $sdk"
 
       - name: Set up Gradle 8.9 fallback
         uses: gradle/actions/setup-gradle@v4
@@ -53,66 +46,93 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/build-logs"
-          # Prefer a project already present as plain files.
           mapfile -t projects < <(find "$GITHUB_WORKSPACE" -maxdepth 6 -type f \( -name settings.gradle -o -name settings.gradle.kts \) -not -path '*/.gradle/*' | sort)
           if (( ${#projects[@]} == 0 )); then
-            # Explicitly choose the app source ZIP, not build-apk-v2-package.zip.
             source_zip="$GITHUB_WORKSPACE/ExpiredGoods_OneUpload.zip"
             if [[ ! -f "$source_zip" ]]; then
-              echo '::error::Missing ExpiredGoods_OneUpload.zip in repository root.'
+              echo '::error::ExpiredGoods_OneUpload.zip not found in repository root.'
               exit 1
             fi
-            echo "Extracting source: $source_zip"
             mkdir -p "$RUNNER_TEMP/expired-goods-source"
             unzip -q "$source_zip" -d "$RUNNER_TEMP/expired-goods-source"
             mapfile -t projects < <(find "$RUNNER_TEMP/expired-goods-source" -maxdepth 9 -type f \( -name settings.gradle -o -name settings.gradle.kts \) | sort)
           fi
           if (( ${#projects[@]} == 0 )); then
-            echo '::error::App ZIP has no settings.gradle or settings.gradle.kts.'
+            echo '::error::No Android Gradle project found.'
             exit 1
           fi
           project_dir="$(dirname "${projects[0]}")"
           echo "PROJECT_DIR=$project_dir" >> "$GITHUB_ENV"
-          echo "App project: $project_dir"
-          ls -la "$project_dir"
+          echo "Project directory: $project_dir"
           if [[ -f "$project_dir/gradlew" ]]; then
             chmod +x "$project_dir/gradlew"
           fi
 
-      - name: Build APK and capture errors
+      - name: Fix Android Button Java compile error
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="$PROJECT_DIR/app/src/main/java/com/stock/expiry/MainActivity.java"
+          if [[ ! -f "$target" ]]; then
+            echo "::error::MainActivity.java missing: $target"
+            exit 1
+          fi
+          python3 - "$target" <<'PY'
+          from pathlib import Path
+          import sys
+          p = Path(sys.argv[1])
+          src = p.read_text(encoding='utf-8')
+          bad = '.setTextAllCaps('
+          good = '.setAllCaps('
+          count = src.count(bad)
+          if count:
+              p.write_text(src.replace(bad, good), encoding='utf-8')
+          print(f'Patched {count} invalid Button method call(s) in {p.name}')
+          if count == 0:
+              print('No old method calls found; source may already be fixed.')
+          PY
+          echo 'Java Button method verification:'
+          grep -n 'setAllCaps\|setTextAllCaps' "$target" || true
+
+      - name: Build APK and show real compiler errors
         shell: bash
         run: |
           set -uo pipefail
           cd "$PROJECT_DIR"
           log="$RUNNER_TEMP/build-logs/full-build.log"
           if [[ -f ./gradlew && -f ./gradle/wrapper/gradle-wrapper.jar ]]; then
-            build_command=(./gradlew)
+            cmd=(./gradlew)
           else
-            build_command=(gradle)
+            cmd=(gradle)
           fi
-          echo "Using: ${build_command[*]}"
-          "${build_command[@]}" assembleDebug --no-daemon --console=plain --stacktrace > "$log" 2>&1
-          status=$?
-          cat "$log"
+          echo "Using: ${cmd[*]}"
+          # GitHub bash starts with -e. Temporarily disable it so failures
+          # do not skip the actual compiler output and error summary.
+          set +e
+          "${cmd[@]}" :app:assembleDebug --no-daemon --console=plain --stacktrace 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          set -e
           {
-            printf 'Build exit code: %s\n' "$status"
-            echo '--- Key errors ---'
-            grep -nEi 'FAILURE:|What went wrong:|Execution failed|error:|^e: |Caused by:|Could not resolve|Could not find|Unresolved reference|A problem occurred' "$log" | tail -n 70 || true
-            echo '--- Last 100 lines ---'
-            tail -n 100 "$log"
+            echo "Build exit code: $status"
+            echo '--- Relevant errors ---'
+            grep -nEi '(^| )error:|^e: |FAILURE:|What went wrong:|Execution failed|Caused by:|Cannot find symbol|Could not resolve|Could not find|Unresolved reference' "$log" | head -n 80 || true
+            echo '--- First 100 build log lines ---'
+            head -n 100 "$log"
           } > "$RUNNER_TEMP/build-logs/error-summary.txt"
+          {
+            echo '## Expired Goods APK build'
+            echo "Exit code: **$status**"
+            echo '### Compiler errors'
+            echo '```text'
+            grep -nEi '(^| )error:|^e: |FAILURE:|What went wrong:|Execution failed|Caused by:|Cannot find symbol|Could not resolve|Could not find|Unresolved reference' "$log" | head -n 45 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
           if (( status != 0 )); then
-            echo '### Build error summary' >> "$GITHUB_STEP_SUMMARY"
-            echo '```text' >> "$GITHUB_STEP_SUMMARY"
-            cat "$RUNNER_TEMP/build-logs/error-summary.txt" | head -n 130 >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            echo '::error::APK build failed. Download build-logs for details.'
-          else
-            echo '### APK compiled successfully' >> "$GITHUB_STEP_SUMMARY"
+            echo '::error::APK compilation failed. Compiler details are in this step above.'
           fi
           exit "$status"
 
-      - name: Upload build logs, including on failure
+      - name: Upload build logs even if build fails
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -129,14 +149,14 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/apk-output"
           count=0
           while IFS= read -r -d '' apk; do
-            count=$((count + 1))
+            count=$((count+1))
             cp "$apk" "$GITHUB_WORKSPACE/apk-output/app-debug-${count}.apk"
-          done < <(find "$PROJECT_DIR" -type f -path '*/build/outputs/apk/*' -name '*debug*.apk' -print0)
+          done < <(find "$PROJECT_DIR/app/build/outputs/apk" -type f -name '*debug*.apk' -print0)
           if (( count == 0 )); then
-            echo '::error::Build completed but no debug APK was found.'
+            echo '::error::Build succeeded, but no debug APK was found.'
             exit 1
           fi
-          echo "Collected $count APK(s)."
+          echo "Copied $count debug APK(s)."
 
       - name: Upload APK
         if: success()
