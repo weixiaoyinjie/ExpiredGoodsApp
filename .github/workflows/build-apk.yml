@@ -13,22 +13,21 @@ permissions:
 
 jobs:
   build:
-    # ubuntu-24.04 already includes Android SDK 35 and Build Tools 35.0.0.
-    # Avoid android-actions/setup-android, whose extra download failed.
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Unpack App ZIP
+      - name: Unpack Android source
         shell: bash
         run: |
           set -euo pipefail
-          test -f ExpiredGoods_OneUpload.zip || { echo 'Missing ExpiredGoods_OneUpload.zip in repo root'; exit 1; }
+          test -f ExpiredGoods_OneUpload.zip || { echo 'ERROR: repository root is missing ExpiredGoods_OneUpload.zip'; exit 1; }
           mkdir -p source
           unzip -oq ExpiredGoods_OneUpload.zip -d source
           test -f source/settings.gradle
           test -f source/app/build.gradle
+          find source/app/src/main -type f | sort
 
       - name: Install Java 17
         uses: actions/setup-java@v4
@@ -36,26 +35,58 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Check preinstalled Android SDK 35
+      - name: Verify preinstalled Android SDK
         shell: bash
         run: |
           set -euo pipefail
-          echo "ANDROID_HOME=${ANDROID_HOME:-unset}"
-          test -n "${ANDROID_HOME:-}" || { echo 'Android SDK environment is missing'; exit 1; }
-          test -f "$ANDROID_HOME/platforms/android-35/android.jar" || { echo 'Android SDK Platform 35 missing'; exit 1; }
-          test -d "$ANDROID_HOME/build-tools/35.0.0" || { echo 'Android Build Tools 35.0.0 missing'; exit 1; }
-          echo 'Preinstalled Android SDK 35 is ready.'
+          : "${ANDROID_HOME:?ANDROID_HOME is not configured}"
+          test -f "$ANDROID_HOME/platforms/android-35/android.jar"
+          test -d "$ANDROID_HOME/build-tools/35.0.0"
+          echo 'Android SDK 35 ready'
 
       - name: Set up Gradle 8.9
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
-      - name: Build debug APK
+      - name: Build APK and print failure details
+        id: apk_build
         shell: bash
-        run: gradle -p source :app:assembleDebug --no-daemon --stacktrace
+        run: |
+          set -uo pipefail
+          set +e
+          gradle -p source :app:assembleDebug --no-daemon --console=plain --stacktrace 2>&1 | tee build-debug.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo ''
+            echo '========== COMPILATION ERRORS: LOOK HERE =========='
+            grep -n -E '(^|[[:space:]])error:|FAILURE:|What went wrong:|Execution failed for task|Could not resolve|Could not find|Android resource linking failed|Manifest merger failed|AAPT:|Caused by:|Compilation failed|BUILD FAILED' build-debug.log | tail -n 90 || true
+            echo '========== LAST 100 LOG LINES =========='
+            tail -n 100 build-debug.log
+            {
+              echo '## APK compilation failed'
+              echo 'Open the **Build APK and print failure details** step and look for **COMPILATION ERRORS**.'
+              echo ''
+              echo '### Last 100 log lines'
+              echo '```text'
+              tail -n 100 build-debug.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$rc"
 
-      - name: Upload the APK
+      - name: Upload build log (even on failure)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ExpiredGoods-BuildLog
+          path: build-debug.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: ExpiredGoods-APK
